@@ -10,6 +10,8 @@ using OrderProcessing.Models;
 using OrderProcessing.Services;
 
 var builder = WebApplication.CreateBuilder(args);
+builder.Logging.ClearProviders();
+builder.Logging.AddConsole();
 
 builder.Services.AddDbContext<OrderProcessingContext>(options =>
     options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));

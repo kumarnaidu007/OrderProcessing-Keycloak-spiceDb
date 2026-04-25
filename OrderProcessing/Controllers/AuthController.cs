@@ -23,103 +23,139 @@ public class AuthController : ControllerBase
     private readonly JwtOptions _jwt;
     private readonly IConfiguration _configuration;
     private readonly IWebHostEnvironment _environment;
+    private readonly ILogger<AuthController> _logger;
 
     public AuthController(
         OrderProcessingContext db,
         IOptions<JwtOptions> jwtOptions,
         IConfiguration configuration,
-        IWebHostEnvironment environment)
+        IWebHostEnvironment environment,
+        ILogger<AuthController> logger)
     {
         _db = db;
         _jwt = jwtOptions.Value;
         _configuration = configuration;
         _environment = environment;
+        _logger = logger;
     }
 
     [HttpPost("register")]
     [AllowAnonymous]
     public async Task<ActionResult<LoginOtpChallengeResponse>> Register([FromBody] RegisterRequest request, CancellationToken ct)
     {
-        if (await _db.Users.AnyAsync(u => u.Email == request.Email, ct))
-            return Conflict(new { message = "Email already registered." });
-
-        var customerRole = await _db.Roles.FirstOrDefaultAsync(r => r.RoleName == Roles.Customer, ct);
-        if (customerRole is null)
-            return StatusCode(500, new { message = "Roles not seeded. Restart the application." });
-
-        var now = DateTime.UtcNow;
-        var user = new User
+        _logger.LogInformation("Register requested for email {Email}.", request.Email);
+        await using var tx = await _db.Database.BeginTransactionAsync(ct);
+        try
         {
-            Email = request.Email,
-            DisplayName = request.DisplayName,
-            Phone = "0000000000",
-            IsActive = true,
-            IsEmailVerified = false,
-            IsPhoneVerified = false,
-            CreatedAtUtc = now,
-            UpdatedAtUtc = now
-        };
-        _db.Users.Add(user);
-        await _db.SaveChangesAsync(ct);
+            if (await _db.Users.AnyAsync(u => u.Email == request.Email, ct))
+            {
+                _logger.LogWarning("Register conflict for email {Email}.", request.Email);
+                return Conflict(new { message = "Email already registered." });
+            }
 
-        var customer = new Customer
+            var customerRole = await _db.Roles.FirstOrDefaultAsync(r => r.RoleName == Roles.Customer, ct);
+            if (customerRole is null)
+            {
+                _logger.LogError("Register failed because customer role is not seeded.");
+                return StatusCode(500, new { message = "Roles not seeded. Restart the application." });
+            }
+
+            var now = DateTime.UtcNow;
+            var user = new User
+            {
+                Email = request.Email,
+                DisplayName = request.DisplayName,
+                Phone = "0000000000",
+                IsActive = true,
+                IsEmailVerified = false,
+                IsPhoneVerified = false,
+                CreatedAtUtc = now,
+                UpdatedAtUtc = now
+            };
+
+            var customer = new Customer
+            {
+                User = user,
+                DisplayName = request.DisplayName,
+                Email = request.Email,
+                Phone = "",
+                ExternalReference = null,
+                IsActive = true,
+                CreatedAtUtc = now
+            };
+            _db.Customers.Add(customer);
+
+            _db.UserRoles.Add(new UserRole
+            {
+                User = user,
+                RoleId = customerRole.RoleId,
+                AssignedAtUtc = now
+            });
+
+            AuditLogWriter.Add(_db, nameof(User), user.UserId.ToString(), "user.register", user.UserId,
+                new { request.Email });
+            await _db.SaveChangesAsync(ct);
+            var challenge = await IssueLoginOtpAsync(user, request.Email, ct);
+            await tx.CommitAsync(ct);
+
+            challenge.Message = "Account created. Verify the OTP to sign in.";
+            _logger.LogInformation("Register succeeded for user {UserId}.", user.UserId);
+            return Ok(challenge);
+        }
+        catch (Exception ex)
         {
-            UserId = user.UserId,
-            DisplayName = request.DisplayName,
-            Email = request.Email,
-            Phone = "",
-            ExternalReference = null,
-            IsActive = true,
-            CreatedAtUtc = now
-        };
-        _db.Customers.Add(customer);
-        await _db.SaveChangesAsync(ct);
-
-        _db.UserRoles.Add(new UserRole
-        {
-            UserId = user.UserId,
-            RoleId = customerRole.RoleId,
-            AssignedAtUtc = now
-        });
-        await _db.SaveChangesAsync(ct);
-
-        AuditLogWriter.Add(_db, nameof(User), user.UserId.ToString(), "user.register", user.UserId,
-            new { request.Email });
-        await _db.SaveChangesAsync(ct);
-
-        var challenge = await IssueLoginOtpAsync(user, request.Email, ct);
-        challenge.Message = "Account created. Verify the OTP to sign in.";
-        return Ok(challenge);
+            await tx.RollbackAsync(ct);
+            _logger.LogError(ex, "Register failed for email {Email}.", request.Email);
+            return StatusCode(500, new { message = "Unexpected error during registration." });
+        }
     }
 
     [HttpPost("login")]
     [AllowAnonymous]
     public async Task<ActionResult<LoginOtpChallengeResponse>> Login([FromBody] RequestOtpRequest request, CancellationToken ct)
     {
-        var user = await _db.Users.FirstOrDefaultAsync(u => u.Email == request.Email, ct);
-        if (user is null)
-            return NotFound(new { message = "No account with this email." });
+        _logger.LogInformation("Login requested for email {Email}.", request.Email);
+        try
+        {
+            var user = await _db.Users.FirstOrDefaultAsync(u => u.Email == request.Email, ct);
+            if (user is null)
+            {
+                _logger.LogWarning("Login failed. Unknown email {Email}.", request.Email);
+                return NotFound(new { message = "No account with this email." });
+            }
 
-        if (!user.IsActive)
-            return Unauthorized(new { message = "Account disabled." });
+            if (!user.IsActive)
+            {
+                _logger.LogWarning("Login blocked. Inactive user {UserId}.", user.UserId);
+                return Unauthorized(new { message = "Account disabled." });
+            }
 
-        var challenge = await IssueLoginOtpAsync(user, request.Email, ct);
-        challenge.Message =
-            "An OTP was generated for this email. Call POST /api/auth/verify-otp with LoginOtpId and Code to receive your access token and refresh token.";
-        return Ok(challenge);
+            var challenge = await IssueLoginOtpAsync(user, request.Email, ct);
+            challenge.Message =
+                "An OTP was generated for this email. Call POST /api/auth/verify-otp with LoginOtpId and Code to receive your access token and refresh token.";
+            _logger.LogInformation("Login OTP issued for user {UserId}.", user.UserId);
+            return Ok(challenge);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Login failed for email {Email}.", request.Email);
+            return StatusCode(500, new { message = "Unexpected error during login." });
+        }
     }
 
     [HttpPost("verify-otp")]
     [AllowAnonymous]
     public async Task<ActionResult<TokenResponse>> VerifyOtp([FromBody] VerifyOtpRequest request, CancellationToken ct)
     {
+        _logger.LogInformation("OTP verification requested for LoginOtpId {LoginOtpId}.", request.LoginOtpId);
         var code = (request.Code ?? "").Trim();
         if (code.Length == 0)
             return BadRequest(new { message = "Code is required." });
-
-        var otpRow = await _db.UserLoginOtps.FirstOrDefaultAsync(o => o.LoginOtpId == request.LoginOtpId, ct);
-        if (otpRow is null)
-            return NotFound(new { message = "Unknown or expired OTP request." });
+        try
+        {
+            var otpRow = await _db.UserLoginOtps.FirstOrDefaultAsync(o => o.LoginOtpId == request.LoginOtpId, ct);
+            if (otpRow is null)
+                return NotFound(new { message = "Unknown or expired OTP request." });
 
         if (otpRow.Purpose != OtpPurposeLogin)
             return BadRequest(new { message = "Invalid OTP purpose." });
@@ -163,9 +199,9 @@ public class AuthController : ControllerBase
             });
         }
 
-        var user = await _db.Users.FirstOrDefaultAsync(u => u.UserId == otpRow.UserId, ct);
-        if (user is null || !user.IsActive)
-            return Unauthorized(new { message = "Account not available." });
+            var user = await _db.Users.FirstOrDefaultAsync(u => u.UserId == otpRow.UserId, ct);
+            if (user is null || !user.IsActive)
+                return Unauthorized(new { message = "Account not available." });
 
         var roleNames = await _db.UserRoles
             .Where(ur => ur.UserId == user.UserId)
@@ -207,25 +243,35 @@ public class AuthController : ControllerBase
             new { user.Email });
         await _db.SaveChangesAsync(ct);
 
-        var token = BuildTokenResponse(user, roleNames, permissionCodes, sessionId);
-        token.RefreshToken = refreshPlain;
-        return Ok(token);
+            var token = BuildTokenResponse(user, roleNames, permissionCodes, sessionId);
+            token.RefreshToken = refreshPlain;
+            _logger.LogInformation("OTP verified successfully for user {UserId}.", user.UserId);
+            return Ok(token);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "OTP verification failed for LoginOtpId {LoginOtpId}.", request.LoginOtpId);
+            return StatusCode(500, new { message = "Unexpected error during OTP verification." });
+        }
     }
 
     [HttpPost("refresh")]
     [AllowAnonymous]
     public async Task<ActionResult<TokenResponse>> Refresh([FromBody] RefreshTokenRequest request, CancellationToken ct)
     {
-        var hash = TokenCrypto.HashRefreshToken(request.RefreshToken.Trim());
-        var session = await _db.UserSessions
-            .Include(s => s.User)
-            .FirstOrDefaultAsync(
-                s => s.SessionId == request.SessionId && s.RefreshTokenHash == hash && s.RevokedAtUtc == null &&
-                     s.ExpiresAtUtc > DateTime.UtcNow,
-                ct);
+        _logger.LogInformation("Refresh requested for session {SessionId}.", request.SessionId);
+        try
+        {
+            var hash = TokenCrypto.HashRefreshToken(request.RefreshToken.Trim());
+            var session = await _db.UserSessions
+                .Include(s => s.User)
+                .FirstOrDefaultAsync(
+                    s => s.SessionId == request.SessionId && s.RefreshTokenHash == hash && s.RevokedAtUtc == null &&
+                         s.ExpiresAtUtc > DateTime.UtcNow,
+                    ct);
 
-        if (session?.User is null || !session.User.IsActive)
-            return Unauthorized(new { message = "Invalid or expired session." });
+            if (session?.User is null || !session.User.IsActive)
+                return Unauthorized(new { message = "Invalid or expired session." });
 
         var roleNames = await _db.UserRoles
             .Where(ur => ur.UserId == session.UserId)
@@ -240,29 +286,46 @@ public class AuthController : ControllerBase
         session.ExpiresAtUtc = DateTime.UtcNow.AddDays(refreshDays);
         await _db.SaveChangesAsync(ct);
 
-        var token = BuildTokenResponse(session.User, roleNames, permissionCodes, session.SessionId);
-        token.RefreshToken = refreshPlain;
-        return Ok(token);
+            var token = BuildTokenResponse(session.User, roleNames, permissionCodes, session.SessionId);
+            token.RefreshToken = refreshPlain;
+            _logger.LogInformation("Refresh succeeded for session {SessionId}.", request.SessionId);
+            return Ok(token);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Refresh failed for session {SessionId}.", request.SessionId);
+            return StatusCode(500, new { message = "Unexpected error during refresh." });
+        }
     }
 
     [HttpPost("logout")]
     [Authorize]
     public async Task<IActionResult> Logout(CancellationToken ct)
     {
-        var userId = long.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier)!);
-        var sid = User.FindFirstValue(AppClaims.SessionId);
-        if (string.IsNullOrEmpty(sid) || !Guid.TryParse(sid, out var sessionId))
-            return BadRequest(new { message = "Access token does not contain an active session id." });
+        _logger.LogInformation("Logout requested.");
+        try
+        {
+            var userId = long.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier)!);
+            var sid = User.FindFirstValue(AppClaims.SessionId);
+            if (string.IsNullOrEmpty(sid) || !Guid.TryParse(sid, out var sessionId))
+                return BadRequest(new { message = "Access token does not contain an active session id." });
 
-        var session = await _db.UserSessions.FirstOrDefaultAsync(
-            s => s.SessionId == sessionId && s.UserId == userId && s.RevokedAtUtc == null, ct);
-        if (session is null)
-            return Ok();
+            var session = await _db.UserSessions.FirstOrDefaultAsync(
+                s => s.SessionId == sessionId && s.UserId == userId && s.RevokedAtUtc == null, ct);
+            if (session is null)
+                return Ok();
 
-        session.RevokedAtUtc = DateTime.UtcNow;
-        AuditLogWriter.Add(_db, nameof(UserSession), sessionId.ToString(), "session.revoke", userId, null);
-        await _db.SaveChangesAsync(ct);
-        return NoContent();
+            session.RevokedAtUtc = DateTime.UtcNow;
+            AuditLogWriter.Add(_db, nameof(UserSession), sessionId.ToString(), "session.revoke", userId, null);
+            await _db.SaveChangesAsync(ct);
+            _logger.LogInformation("Session {SessionId} revoked for user {UserId}.", sessionId, userId);
+            return NoContent();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Logout failed.");
+            return StatusCode(500, new { message = "Unexpected error during logout." });
+        }
     }
 
     private async Task<List<string>> LoadPermissionCodesAsync(long userId, CancellationToken ct) =>
@@ -331,7 +394,7 @@ public class AuthController : ControllerBase
         };
         _db.UserLoginOtps.Add(row);
         await _db.SaveChangesAsync(ct);
-
+        _logger.LogInformation("OTP generated for user {UserId}, expires at {ExpiresAtUtc}.", user.UserId, expires);
         return new LoginOtpChallengeResponse
         {
             Message = "",

@@ -95,14 +95,13 @@ public class OrderFlowTests
 
         var firstAttemptOrder = await db.Orders.AsNoTracking().SingleAsync();
         var firstAttemptProduct = await db.Products.AsNoTracking().SingleAsync();
-        var firstAttemptJob = await db.OrderProcessingJobs.AsNoTracking().SingleAsync();
+        var firstAttemptJob = await db.OrderProcessingJobs.SingleAsync();
         Assert.Equal(OrderStatuses.Processing, firstAttemptOrder.Status);
         Assert.Equal(8, firstAttemptProduct.AvailableQuantity);
         Assert.Equal(JobStatuses.Pending, firstAttemptJob.JobStatus);
         Assert.NotNull(firstAttemptJob.NextRetryAtUtc);
 
         firstAttemptJob.NextRetryAtUtc = DateTime.UtcNow.AddSeconds(-1);
-        db.OrderProcessingJobs.Update(firstAttemptJob);
         await db.SaveChangesAsync();
 
         await InvokePrivateAsync(worker, "TryProcessNextJobAsync", db, CancellationToken.None);
@@ -310,6 +309,13 @@ public class OrderFlowTests
 
     private static OrdersController BuildOrdersController(OrderProcessingContext db, long userId)
     {
+        var claims = new[]
+        {
+            new Claim(ClaimTypes.NameIdentifier, userId.ToString()),
+            new Claim(AppClaims.Permission, PermissionCodes.OrdersCreate),
+            new Claim(AppClaims.Permission, PermissionCodes.OrdersReadOwn)
+        };
+
         var controller = new OrdersController(db, NullLogger<OrdersController>.Instance)
         {
             ControllerContext = new ControllerContext
@@ -318,7 +324,7 @@ public class OrderFlowTests
                 {
                     User = new ClaimsPrincipal(
                         new ClaimsIdentity(
-                            [new Claim(ClaimTypes.NameIdentifier, userId.ToString())],
+                            claims,
                             "TestAuth"))
                 }
             }

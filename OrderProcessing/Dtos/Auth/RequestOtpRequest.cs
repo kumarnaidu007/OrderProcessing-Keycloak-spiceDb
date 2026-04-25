@@ -6,5 +6,5 @@ namespace OrderProcessing.Dtos.Auth;
 public class RequestOtpRequest
 {
     [Required, EmailAddress, MaxLength(256)]
-    public string Email { get; set; } = "";
+    public required string Email { get; init; }
 }
