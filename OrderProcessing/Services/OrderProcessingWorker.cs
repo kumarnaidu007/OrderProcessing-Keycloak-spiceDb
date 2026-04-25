@@ -109,25 +109,47 @@ public class OrderProcessingWorker : BackgroundService
             AddDomainEvent(db, order.OrderId, job.JobId, DomainEventTypes.OrderProcessingStarted);
         }
 
+        var linesToDeduct = new List<OrderItem>();
         foreach (var line in order.OrderItems)
         {
             var idem = $"order-{order.OrderId}-deduct-{line.ProductId}";
             if (await db.InventoryLedgers.AnyAsync(l => l.IdempotencyKey == idem, ct))
                 continue;
+            linesToDeduct.Add(line);
+        }
 
-            var product = await db.Products.FirstAsync(p => p.ProductId == line.ProductId, ct);
-            if (product.AvailableQuantity < line.Quantity)
+        var requiredByProduct = linesToDeduct
+            .GroupBy(x => x.ProductId)
+            .ToDictionary(g => g.Key, g => g.Sum(x => x.Quantity));
+
+        if (requiredByProduct.Count > 0)
+        {
+            var productIds = requiredByProduct.Keys.ToList();
+            var productsForCheck = await db.Products
+                .Where(p => productIds.Contains(p.ProductId))
+                .ToDictionaryAsync(p => p.ProductId, ct);
+
+            foreach (var needed in requiredByProduct)
             {
-                var msg = $"Insufficient stock for product {product.Name} (id {product.ProductId}).";
-                FailOrder(db, order, msg);
-                AddDomainEvent(db, order.OrderId, job.JobId, DomainEventTypes.OrderFailed);
-                await MarkJobTerminalAsync(db, job, JobStatuses.Failed, msg, ct);
-                await db.SaveChangesAsync(ct);
-                await tx.CommitAsync(ct);
-                _logger.LogWarning("Order {OrderId} failed: {Reason}", order.OrderId, msg);
-                return;
+                var product = productsForCheck[needed.Key];
+                if (product.AvailableQuantity < needed.Value)
+                {
+                    var msg = $"Insufficient stock for product {product.Name} (id {product.ProductId}).";
+                    FailOrder(db, order, msg);
+                    AddDomainEvent(db, order.OrderId, job.JobId, DomainEventTypes.OrderFailed);
+                    await MarkJobTerminalAsync(db, job, JobStatuses.Failed, msg, ct);
+                    await db.SaveChangesAsync(ct);
+                    await tx.CommitAsync(ct);
+                    _logger.LogWarning("Order {OrderId} failed: {Reason}", order.OrderId, msg);
+                    return;
+                }
             }
+        }
 
+        foreach (var line in linesToDeduct)
+        {
+            var idem = $"order-{order.OrderId}-deduct-{line.ProductId}";
+            var product = await db.Products.FirstAsync(p => p.ProductId == line.ProductId, ct);
             product.AvailableQuantity -= line.Quantity;
             product.UpdatedAtUtc = DateTime.UtcNow;
             db.InventoryLedgers.Add(new InventoryLedger
@@ -198,15 +220,40 @@ public class OrderProcessingWorker : BackgroundService
         {
             payment.Status = PaymentStatuses.Failed;
             payment.FailureReason = "Simulated payment decline.";
-            TransitionOrderStatus(db, order, OrderStatuses.Failed, payment.FailureReason);
-            order.FailureReason = payment.FailureReason;
-            order.UpdatedAtUtc = DateTime.UtcNow;
             AddDomainEvent(db, order.OrderId, job.JobId, DomainEventTypes.PaymentFailed);
+
+            var maxPaymentAttempts = _configuration.GetValue("OrderProcessing:MaxPaymentAttempts", 2);
+            if (payment.AttemptNo < Math.Max(1, maxPaymentAttempts))
+            {
+                payment.Status = PaymentStatuses.Pending;
+                payment.FailureReason = null;
+                job.JobStatus = JobStatuses.Pending;
+                job.NextRetryAtUtc = DateTime.UtcNow.Add(GetBackoff(payment.AttemptNo));
+                job.LockedAtUtc = null;
+                job.LockExpiresAtUtc = null;
+                job.LockToken = null;
+                job.LastError = "Simulated payment decline; retry scheduled.";
+                job.UpdatedAtUtc = DateTime.UtcNow;
+                AddDomainEvent(db, order.OrderId, job.JobId, DomainEventTypes.PaymentRetryScheduled);
+                await db.SaveChangesAsync(ct);
+                await tx.CommitAsync(ct);
+                _logger.LogWarning(
+                    "Order {OrderId} payment transient failure. Scheduled retry attempt {Attempt}.",
+                    order.OrderId,
+                    payment.AttemptNo + 1);
+                return;
+            }
+
+            var finalFailure = "Simulated payment decline after retries.";
+            await RestoreInventoryAsync(db, order, job.JobId, ct);
+            TransitionOrderStatus(db, order, OrderStatuses.Failed, finalFailure);
+            order.FailureReason = finalFailure;
+            order.UpdatedAtUtc = DateTime.UtcNow;
             AddDomainEvent(db, order.OrderId, job.JobId, DomainEventTypes.OrderFailed);
-            await MarkJobTerminalAsync(db, job, JobStatuses.Failed, payment.FailureReason, ct);
+            await MarkJobTerminalAsync(db, job, JobStatuses.Failed, finalFailure, ct);
             await db.SaveChangesAsync(ct);
             await tx.CommitAsync(ct);
-            _logger.LogWarning("Order {OrderId} payment failed (simulated).", order.OrderId);
+            _logger.LogWarning("Order {OrderId} payment failed after retries.", order.OrderId);
             return;
         }
 
@@ -241,6 +288,8 @@ public class OrderProcessingWorker : BackgroundService
     {
         if (order.Status == toStatus)
             return;
+        if (!OrderStatusTransitions.IsValid(order.Status, toStatus))
+            throw new InvalidOperationException($"Invalid order status transition {order.Status} -> {toStatus}.");
         var from = order.Status;
         order.Status = toStatus;
         order.UpdatedAtUtc = DateTime.UtcNow;
@@ -289,6 +338,41 @@ public class OrderProcessingWorker : BackgroundService
         return Task.CompletedTask;
     }
 
+    private static async Task RestoreInventoryAsync(OrderProcessingContext db, Order order, long? jobId, CancellationToken ct)
+    {
+        foreach (var line in order.OrderItems)
+        {
+            var deductKey = $"order-{order.OrderId}-deduct-{line.ProductId}";
+            var restoreKey = $"order-{order.OrderId}-restore-{line.ProductId}";
+            var wasDeducted = await db.InventoryLedgers.AnyAsync(l => l.IdempotencyKey == deductKey, ct);
+            if (!wasDeducted)
+                continue;
+            var alreadyRestored = await db.InventoryLedgers.AnyAsync(l => l.IdempotencyKey == restoreKey, ct);
+            if (alreadyRestored)
+                continue;
+
+            var product = await db.Products.FirstAsync(p => p.ProductId == line.ProductId, ct);
+            product.AvailableQuantity += line.Quantity;
+            product.UpdatedAtUtc = DateTime.UtcNow;
+            db.InventoryLedgers.Add(new InventoryLedger
+            {
+                OrderId = order.OrderId,
+                ProductId = line.ProductId,
+                MovementType = InventoryMovementTypes.SaleRestore,
+                Quantity = line.Quantity,
+                IdempotencyKey = restoreKey,
+                Succeeded = true,
+                CreatedAtUtc = DateTime.UtcNow
+            });
+            AddDomainEvent(
+                db,
+                order.OrderId,
+                jobId,
+                DomainEventTypes.InventoryRestored,
+                $"{{\"productId\":{line.ProductId},\"quantity\":{line.Quantity}}}");
+        }
+    }
+
     private async Task HandleJobErrorAsync(OrderProcessingContext db, OrderProcessingJob job, string message, CancellationToken ct)
     {
         job.RetryCount += 1;
@@ -304,21 +388,10 @@ public class OrderProcessingWorker : BackgroundService
             var order = await db.Orders.FirstAsync(o => o.OrderId == job.OrderId, ct);
             if (order.Status is not (OrderStatuses.Completed or OrderStatuses.Failed or OrderStatuses.Cancelled))
             {
-                var from = order.Status;
-                order.Status = OrderStatuses.Failed;
-                order.FailureReason = message.Length > 500 ? message[..500] : message;
+                var reason = message.Length > 500 ? message[..500] : message;
+                TransitionOrderStatus(db, order, OrderStatuses.Failed, reason);
+                order.FailureReason = reason;
                 order.UpdatedAtUtc = DateTime.UtcNow;
-                db.OrderStatusHistories.Add(new OrderStatusHistory
-                {
-                    OrderId = order.OrderId,
-                    FromStatus = from,
-                    ToStatus = OrderStatuses.Failed,
-                    Reason = message,
-                    ActorType = "Worker",
-                    ActorUserId = null,
-                    CorrelationId = order.CorrelationId,
-                    OccurredAtUtc = DateTime.UtcNow
-                });
             }
 
             _logger.LogError("Job {JobId} exceeded retries; marked failed.", job.JobId);

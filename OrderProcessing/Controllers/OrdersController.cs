@@ -100,7 +100,22 @@ public class OrdersController : ControllerBase
             order.OrderItems.Add(line);
 
         _db.Orders.Add(order);
-        await _db.SaveChangesAsync(ct);
+        try
+        {
+            await _db.SaveChangesAsync(ct);
+        }
+        catch (DbUpdateException ex) when (IsUniqueIdempotencyViolation(ex))
+        {
+            var raced = await _db.Orders
+                .Include(o => o.OrderItems)
+                .ThenInclude(i => i.Product)
+                .Include(o => o.OrderShippingSnapshot)
+                .FirstOrDefaultAsync(o => o.IdempotencyKey == idempotencyKey, ct);
+            if (raced is null)
+                throw;
+            _logger.LogInformation("Idempotent race replay for order {OrderId} key {Key}", raced.OrderId, idempotencyKey);
+            return Ok(MapOrder(raced));
+        }
 
         var ship = new OrderShippingSnapshot
         {
@@ -208,6 +223,74 @@ public class OrdersController : ControllerBase
         });
     }
 
+    [HttpPost("{orderId:long}/cancel")]
+    [Authorize(Policy = PolicyNames.OrdersRead)]
+    public async Task<ActionResult<OrderStatusResponse>> Cancel(long orderId, CancellationToken ct)
+    {
+        var order = await _db.Orders.FirstOrDefaultAsync(o => o.OrderId == orderId, ct);
+        if (order is null)
+            return NotFound();
+        if (!await CanAccessOrderAsync(order, ct))
+            return Forbid();
+
+        if (order.Status == OrderStatuses.Cancelled)
+            return Ok(ToStatusResponse(order));
+
+        if (order.Status != OrderStatuses.Pending)
+            return Conflict(new { message = $"Only {OrderStatuses.Pending} orders can be cancelled. Current status: {order.Status}." });
+
+        var userId = long.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier)!);
+        if (!OrderStatusTransitions.IsValid(order.Status, OrderStatuses.Cancelled))
+            return Conflict(new { message = $"Invalid transition from {order.Status} to {OrderStatuses.Cancelled}." });
+
+        var from = order.Status;
+        var now = DateTime.UtcNow;
+        order.Status = OrderStatuses.Cancelled;
+        order.CancelledAtUtc = now;
+        order.UpdatedAtUtc = now;
+        order.FailureReason = null;
+
+        _db.OrderStatusHistories.Add(new OrderStatusHistory
+        {
+            OrderId = order.OrderId,
+            FromStatus = from,
+            ToStatus = OrderStatuses.Cancelled,
+            Reason = "Order cancelled by user request",
+            ActorType = "Customer",
+            ActorUserId = userId,
+            CorrelationId = order.CorrelationId,
+            OccurredAtUtc = now
+        });
+        _db.OrderDomainEvents.Add(new OrderDomainEvent
+        {
+            OrderId = order.OrderId,
+            JobId = null,
+            EventType = DomainEventTypes.OrderCancelled,
+            PayloadJson = "{}",
+            Severity = "Info",
+            ActorType = "Customer",
+            ActorUserId = userId,
+            CorrelationId = order.CorrelationId,
+            OccurredAtUtc = now
+        });
+        AuditLogWriter.Add(_db, nameof(Order), order.OrderId.ToString(), "order.cancel", userId, null);
+
+        var job = await _db.OrderProcessingJobs.FirstOrDefaultAsync(j => j.OrderId == order.OrderId, ct);
+        if (job is not null && job.JobStatus is JobStatuses.Pending or JobStatuses.InProgress)
+        {
+            job.JobStatus = JobStatuses.Failed;
+            job.LastError = "Order was cancelled by user.";
+            job.LockedAtUtc = null;
+            job.LockExpiresAtUtc = null;
+            job.LockToken = null;
+            job.UpdatedAtUtc = now;
+        }
+
+        await _db.SaveChangesAsync(ct);
+        _logger.LogInformation("Order {OrderId} cancelled by user {UserId}.", order.OrderId, userId);
+        return Ok(ToStatusResponse(order));
+    }
+
     [HttpGet]
     [Authorize(Policy = PolicyNames.OrdersList)]
     public async Task<ActionResult<IReadOnlyList<OrderResponse>>> List(
@@ -307,4 +390,18 @@ public class OrdersController : ControllerBase
             }).ToList()
         };
     }
+
+    private static OrderStatusResponse ToStatusResponse(Order order) => new()
+    {
+        OrderId = order.OrderId,
+        Status = order.Status,
+        FailureReason = order.FailureReason,
+        CreatedAtUtc = order.CreatedAtUtc,
+        UpdatedAtUtc = order.UpdatedAtUtc,
+        CompletedAtUtc = order.CompletedAtUtc
+    };
+
+    private static bool IsUniqueIdempotencyViolation(DbUpdateException ex) =>
+        ex.InnerException?.Message.Contains("UQ_Orders_IdempotencyKey", StringComparison.OrdinalIgnoreCase) == true
+        || ex.Message.Contains("UQ_Orders_IdempotencyKey", StringComparison.OrdinalIgnoreCase);
 }

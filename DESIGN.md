@@ -26,7 +26,7 @@ The design separates request-time writes from background processing to satisfy a
   - `CustomerId`
   - `Status` (`Pending`, `Processing`, `Completed`, `Failed`, `Cancelled`)
   - `TotalAmount`, `Currency`
-  - `IdempotencyKey` (unique)
+  - `IdempotencyKey` (unique; dedupe key supplied by client)
   - timestamps and failure metadata
 - `OrderItems`
   - `OrderItemId` (PK)
@@ -43,7 +43,7 @@ The design separates request-time writes from background processing to satisfy a
   - lock metadata for safe worker pickup
 - `InventoryLedger`
   - immutable record of inventory movement
-  - `IdempotencyKey` unique to prevent duplicate deductions
+  - `IdempotencyKey` unique to prevent duplicate deductions/restores
 - `PaymentAttempts`
   - payment simulation attempts
   - unique idempotency constraint for no duplicate external side effects
@@ -66,15 +66,23 @@ The design separates request-time writes from background processing to satisfy a
 2. API enqueues `OrderProcessingJobs` row.
 3. Worker loads queued job and transitions to `Processing`.
 4. Worker validates stock, updates inventory, simulates payment.
-5. Worker finalizes order into `Completed` or `Failed`.
-6. Status/history/events are written for visibility and debugging.
+5. Payment failure is retried (transient) up to configured max attempts.
+6. On final payment failure, worker compensates inventory (restore ledger entries) and marks `Failed`.
+7. Worker finalizes order into `Completed` or `Failed`.
+8. Status/history/events are written for visibility and debugging.
 
 ## Consistency guarantees
 
 - uniqueness constraints (`Orders.IdempotencyKey`, ledger/payment idempotency keys) prevent duplicate effects
-- worker processing writes are coordinated with order status updates
+- worker processing writes are coordinated with order status updates via a strict transition guard
 - inventory changes are represented in ledger for recoverability/auditability
+- compensation entries (`SaleRestore`) prevent inventory drift when payment finally fails
 - state transitions are constrained by application flow and persisted history
+
+## Duplicate request semantics
+
+- If client sends the same `Idempotency-Key`, duplicate create requests resolve to the original order (including race-safe handling of unique-key conflicts).
+- If client omits the header, server generates a fresh key and does not deduplicate by payload.
 
 ## Assumptions
 

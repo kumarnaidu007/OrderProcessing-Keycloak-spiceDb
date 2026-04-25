@@ -23,4 +23,14 @@ public class ConstantsTests
         Assert.Equal("Succeeded", JobStatuses.Succeeded);
         Assert.Equal("Failed", JobStatuses.Failed);
     }
+
+    [Fact]
+    public void Order_transition_guard_allows_only_valid_paths()
+    {
+        Assert.True(OrderStatusTransitions.IsValid(OrderStatuses.Pending, OrderStatuses.Processing));
+        Assert.True(OrderStatusTransitions.IsValid(OrderStatuses.Processing, OrderStatuses.Completed));
+        Assert.True(OrderStatusTransitions.IsValid(OrderStatuses.Pending, OrderStatuses.Failed));
+        Assert.False(OrderStatusTransitions.IsValid(OrderStatuses.Completed, OrderStatuses.Processing));
+        Assert.False(OrderStatusTransitions.IsValid(OrderStatuses.Cancelled, OrderStatuses.Completed));
+    }
 }

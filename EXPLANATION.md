@@ -14,9 +14,17 @@ Order creation only persists request data and queues a processing job. Inventory
 
 Idempotency keys and uniqueness constraints are used to protect against duplicate submissions and duplicate side effects. This is important for retry behavior and network/client replays.
 
+The create-order path also handles uniqueness races deterministically: if two concurrent requests use the same idempotency key, the second request returns the already-created order instead of failing unexpectedly.
+
+Idempotency guarantees are keyed (header-based) rather than payload-hash based. If the header is omitted, the server generates a new key and treats the request as a new order.
+
 ### 4) Event/history-oriented observability
 
 Status history, domain events, and audit logs provide a trace of each order lifecycle. This simplifies debugging and validation during failure scenarios.
+
+### 5) Explicit transition and compensation rules
+
+Order transitions are validated against an allowed transition matrix to prevent illegal state moves. Payment failures are treated as transient until max payment attempts are reached; when final failure occurs, inventory is compensated using idempotent restore ledger entries.
 
 ### 5) Bootstrapped seed data
 
@@ -39,6 +47,7 @@ This allows a fresh clone to be usable quickly.
 
 - Preventing duplicate side effects under retries/replays.
 - Coordinating order status transitions with side-effect writes.
+- Keeping inventory consistent when payment ultimately fails.
 - Keeping the evaluator setup simple while still demonstrating reliability patterns.
 
 ## Improvements with more time

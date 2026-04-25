@@ -65,10 +65,16 @@ Other tables (`Orders`, `OrderItems`, `InventoryLedger`, `PaymentAttempts`, etc.
 - Order creation: `POST /api/orders`
 - Order details: `GET /api/orders/{id}`
 - Order status: `GET /api/orders/{id}/status`
+- Order cancellation: `POST /api/orders/{id}/cancel` (allowed while order is `Pending`)
 - Order listing: `GET /api/orders`
 
 ## Notes for evaluator
 
 - Order creation is asynchronous; processing is done by `OrderProcessingWorker`.
 - Idempotency is enforced via idempotency keys and unique constraints.
+- Duplicate protection is guaranteed for requests that reuse the same `Idempotency-Key`.
+- If `Idempotency-Key` is omitted, server generates a new key and identical payload re-submissions are treated as new orders.
 - Retry behavior is implemented through `OrderProcessingJobs`.
+- Payment declines are retried up to `OrderProcessing:MaxPaymentAttempts` (default `2`).
+- If payment fails after retries, inventory is compensated using idempotent `SaleRestore` ledger entries.
+- Order status changes are validated by an explicit transition guard.

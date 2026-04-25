@@ -26,6 +26,7 @@ public static class JobStatuses
 public static class InventoryMovementTypes
 {
     public const string SaleDeduct = "SaleDeduct";
+    public const string SaleRestore = "SaleRestore";
 }
 
 public static class PaymentStatuses
@@ -38,10 +39,13 @@ public static class PaymentStatuses
 public static class DomainEventTypes
 {
     public const string OrderCreated = "OrderCreated";
+    public const string OrderCancelled = "OrderCancelled";
     public const string OrderProcessingStarted = "OrderProcessingStarted";
     public const string InventoryDeducted = "InventoryDeducted";
+    public const string InventoryRestored = "InventoryRestored";
     public const string PaymentSucceeded = "PaymentSucceeded";
     public const string PaymentFailed = "PaymentFailed";
+    public const string PaymentRetryScheduled = "PaymentRetryScheduled";
     public const string OrderCompleted = "OrderCompleted";
     public const string OrderFailed = "OrderFailed";
 }
