@@ -92,6 +92,8 @@ public class AuthController : ControllerBase
                 AssignedAtUtc = now
             });
 
+            await _db.SaveChangesAsync(ct);
+
             AuditLogWriter.Add(_db, nameof(User), user.UserId.ToString(), "user.register", user.UserId,
                 new { request.Email });
             await _db.SaveChangesAsync(ct);

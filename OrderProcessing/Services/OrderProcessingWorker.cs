@@ -51,9 +51,10 @@ public class OrderProcessingWorker : BackgroundService
     {
         var now = DateTime.UtcNow;
         var job = await db.OrderProcessingJobs
-            .Where(j => j.JobStatus == JobStatuses.Pending
-                        && (j.NextRetryAtUtc == null || j.NextRetryAtUtc <= now)
-                        && (j.LockExpiresAtUtc == null || j.LockExpiresAtUtc < now))
+            .Where(j =>
+                (j.JobStatus == JobStatuses.Pending || j.JobStatus == JobStatuses.InProgress)
+                && (j.NextRetryAtUtc == null || j.NextRetryAtUtc <= now)
+                && (j.LockExpiresAtUtc == null || j.LockExpiresAtUtc < now))
             .OrderBy(j => j.CreatedAtUtc)
             .FirstOrDefaultAsync(ct);
 
@@ -75,7 +76,14 @@ public class OrderProcessingWorker : BackgroundService
         catch (Exception ex)
         {
             _logger.LogError(ex, "Processing failed for job {JobId} order {OrderId}", job.JobId, job.OrderId);
-            await HandleJobErrorAsync(db, job, ex.Message, ct);
+            db.ChangeTracker.Clear();
+            var jobRow = await db.OrderProcessingJobs.FirstOrDefaultAsync(j => j.JobId == job.JobId, ct);
+            if (jobRow is null)
+            {
+                _logger.LogError("Failed to reload job {JobId} after processing error.", job.JobId);
+                return;
+            }
+            await HandleJobErrorAsync(db, jobRow, ex.Message, ct);
         }
     }
 
@@ -186,7 +194,7 @@ public class OrderProcessingWorker : BackgroundService
             payment = new PaymentAttempt
             {
                 OrderId = order.OrderId,
-                AttemptNo = 0,
+                AttemptNo = 1,
                 Amount = order.TotalAmount,
                 Status = PaymentStatuses.Pending,
                 ProviderReference = "SIM",
@@ -197,6 +205,8 @@ public class OrderProcessingWorker : BackgroundService
             db.PaymentAttempts.Add(payment);
             await db.SaveChangesAsync(ct);
         }
+        else
+            payment.AttemptNo += 1;
 
         if (payment.Status == PaymentStatuses.Succeeded)
         {
@@ -213,7 +223,6 @@ public class OrderProcessingWorker : BackgroundService
             return;
         }
 
-        payment.AttemptNo += 1;
         var failRate = _configuration.GetValue("OrderProcessing:PaymentFailureRate", 0.0);
         var fail = Random.Shared.NextDouble() < failRate;
         if (fail)

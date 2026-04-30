@@ -224,6 +224,83 @@ public class OrderFlowTests
         Assert.Equal(JobStatuses.Failed, job.JobStatus);
     }
 
+    [Fact]
+    public async Task Stale_inprogress_job_is_recovered_and_processed()
+    {
+        await using var db = await CreateDbAsync();
+        var (user, _, address, product) = await SeedCustomerAndProductAsync(db);
+
+        var controller = BuildOrdersController(db, user.UserId);
+        var request = new CreateOrderRequest
+        {
+            CustomerAddressId = address.CustomerAddressId,
+            Items = [new OrderLineRequest { ProductId = product.ProductId, Quantity = 2 }]
+        };
+
+        var created = await controller.Create(request, "stale-inprogress-key", CancellationToken.None);
+        _ = Assert.IsType<CreatedAtActionResult>(created.Result);
+
+        var job = await db.OrderProcessingJobs.SingleAsync();
+        job.JobStatus = JobStatuses.InProgress;
+        job.LockedAtUtc = DateTime.UtcNow.AddMinutes(-10);
+        job.LockExpiresAtUtc = DateTime.UtcNow.AddMinutes(-5);
+        job.LockToken = Guid.NewGuid();
+        job.UpdatedAtUtc = DateTime.UtcNow.AddMinutes(-10);
+        await db.SaveChangesAsync();
+
+        var worker = BuildWorker(paymentFailureRate: 0);
+        await InvokePrivateAsync(worker, "TryProcessNextJobAsync", db, CancellationToken.None);
+
+        var order = await db.Orders.AsNoTracking().SingleAsync();
+        var savedProduct = await db.Products.AsNoTracking().SingleAsync();
+        var finalJob = await db.OrderProcessingJobs.AsNoTracking().SingleAsync();
+
+        Assert.Equal(OrderStatuses.Completed, order.Status);
+        Assert.Equal(8, savedProduct.AvailableQuantity);
+        Assert.Equal(JobStatuses.Succeeded, finalJob.JobStatus);
+    }
+
+    [Fact]
+    public async Task Active_inprogress_job_with_unexpired_lock_is_not_picked()
+    {
+        await using var db = await CreateDbAsync();
+        var (user, _, address, product) = await SeedCustomerAndProductAsync(db);
+
+        var controller = BuildOrdersController(db, user.UserId);
+        var request = new CreateOrderRequest
+        {
+            CustomerAddressId = address.CustomerAddressId,
+            Items = [new OrderLineRequest { ProductId = product.ProductId, Quantity = 2 }]
+        };
+
+        var created = await controller.Create(request, "active-inprogress-key", CancellationToken.None);
+        _ = Assert.IsType<CreatedAtActionResult>(created.Result);
+
+        var job = await db.OrderProcessingJobs.SingleAsync();
+        var originalUpdatedAt = job.UpdatedAtUtc;
+        var originalAttempt = job.Attempt;
+        job.JobStatus = JobStatuses.InProgress;
+        job.LockedAtUtc = DateTime.UtcNow;
+        job.LockExpiresAtUtc = DateTime.UtcNow.AddMinutes(5);
+        job.LockToken = Guid.NewGuid();
+        await db.SaveChangesAsync();
+
+        var worker = BuildWorker(paymentFailureRate: 0);
+        await InvokePrivateAsync(worker, "TryProcessNextJobAsync", db, CancellationToken.None);
+
+        var order = await db.Orders.AsNoTracking().SingleAsync();
+        var savedProduct = await db.Products.AsNoTracking().SingleAsync();
+        var finalJob = await db.OrderProcessingJobs.AsNoTracking().SingleAsync();
+
+        Assert.Equal(OrderStatuses.Pending, order.Status);
+        Assert.Equal(10, savedProduct.AvailableQuantity);
+        Assert.Equal(JobStatuses.InProgress, finalJob.JobStatus);
+        Assert.Equal(originalAttempt, finalJob.Attempt);
+        Assert.True(
+            Math.Abs((finalJob.UpdatedAtUtc - originalUpdatedAt).TotalMilliseconds) < 1,
+            "Worker should not update the job when lock is still active.");
+    }
+
     private static async Task<OrderProcessingContext> CreateDbAsync()
     {
         var dbName = $"OrderProcessingTests_{Guid.NewGuid():N}";
