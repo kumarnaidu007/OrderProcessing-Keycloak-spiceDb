@@ -1,6 +1,6 @@
 # Order Processing API
 
-ASP.NET Core 8 backend for reliable asynchronous order processing with OTP login, JWT auth, RBAC permissions, and background workers.
+ASP.NET Core 8 backend for asynchronous order processing with **Keycloak** (OpenID Connect JWTs, realm roles) and optional **SpiceDB** checks for order-level permissions. A hosted **OrderProcessingWorker** drives the pipeline.
 
 ## Submission documents
 
@@ -8,42 +8,55 @@ ASP.NET Core 8 backend for reliable asynchronous order processing with OTP login
 - `EXPLANATION.md`: key design decisions, trade-offs, challenges, and future improvements.
 - `ASSUMPTIONS.md`: assumptions and intentionally added scope.
 
-## Quick start (one command with Docker)
+## Quick start with Docker (recommended)
 
-From solution root (`OrderProcessing/`):
+Run from the **repository root** (parent of this folder — where `docker-compose.yml` lives):
 
 ```bash
 docker compose up --build
 ```
 
-What this does:
+What starts:
 
-- starts SQL Server container
-- starts API container
-- creates schema on startup (`EnsureCreatedAsync`)
-- seeds required baseline data:
-  - roles (`Admin`, `Customer`)
-  - permissions and role-permission links
-  - admin user from `Bootstrap:AdminEmail`
-  - 4 sample products
+- **SQL Server** — persistence; API waits for DB health before starting.
+- **Keycloak** — realm `order-processing` imported from `keycloak/import/`; JWT validation uses metadata from inside the compose network and issuers for `localhost`.
+- **Postgres + SpiceDB** — migrate, serve, then `zed schema write` for `spicedb-schema.zed`.
+- **API** — `EnsureCreatedAsync` creates the EF schema; **DataSeeder** adds sample products if the catalog is empty.
 
-API base URL: `http://localhost:8080`  
-Swagger UI: `http://localhost:8080/swagger`
+URLs: API `http://localhost:8080`, Swagger `http://localhost:8080/swagger`, Keycloak `http://localhost:8081`.
+
+### Authentication (Swagger / API)
+
+Obtain an access token (password grant — development only):
+
+```http
+POST http://localhost:8081/realms/order-processing/protocol/openid-connect/token
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=password&client_id=order-api&username=testuser&password=password
+```
+
+Use `access_token` as Bearer token. Dev users are defined in `keycloak/import/order-processing-realm.json` (for example `testuser` / `password`, `adminuser` / `admin`).
+
+Users are **provisioned in the app database** on first authenticated use (`ApplicationUserResolver`) when they call the API with a valid Keycloak token.
 
 ## Local run without Docker
 
-Set a valid SQL Server connection string in `appsettings.json`, then:
+You need a reachable SQL Server, Keycloak configured like `appsettings.json` / dev settings, and optionally SpiceDB if you set `SpiceDb:Enabled` to `true`.
+
+1. Set `ConnectionStrings:DefaultConnection` in `appsettings.Development.json` (or user secrets).
+2. Run Keycloak (or point `Keycloak:*` at your instance) with realm `order-processing`, client `order-api`, and matching issuer URLs.
+3. From this project directory:
 
 ```bash
-cd OrderProcessing
 dotnet run
 ```
 
-Schema creation + seeding still run at startup.
+Schema creation and product seeding still run at startup.
 
 ## Run tests
 
-From solution root:
+From the repository root (solution folder):
 
 ```bash
 dotnet test
@@ -51,13 +64,9 @@ dotnet test
 
 ## Seeded baseline data
 
-At startup, the app seeds only when missing:
+On startup, **sample products** are inserted only when no products exist yet. Roles for authorization come from **Keycloak** JWTs (`realm_access.roles`), not from seeding the SQL `Roles` table for normal Docker flow.
 
-- roles and permissions (`Roles`, `Permissions`, `RolePermissions`)
-- admin user and admin role assignment (`Users`, `UserRoles`)
-- sample products (`Products`)
-
-Other tables (`Orders`, `OrderItems`, `InventoryLedger`, `PaymentAttempts`, etc.) are populated by normal API + worker flow.
+Other tables are filled by API usage and the background worker.
 
 ## Minimum API surface
 
@@ -72,9 +81,10 @@ Other tables (`Orders`, `OrderItems`, `InventoryLedger`, `PaymentAttempts`, etc.
 
 - Order creation is asynchronous; processing is done by `OrderProcessingWorker`.
 - Idempotency is enforced via idempotency keys and unique constraints.
-- Duplicate protection is guaranteed for requests that reuse the same `Idempotency-Key`.
-- If `Idempotency-Key` is omitted, server generates a new key and identical payload re-submissions are treated as new orders.
-- Retry behavior is implemented through `OrderProcessingJobs`.
+- Duplicate protection applies when the same `Idempotency-Key` is reused.
+- If `Idempotency-Key` is omitted, identical payload re-submissions may create separate orders.
+- Retry behavior uses `OrderProcessingJobs`.
 - Payment declines are retried up to `OrderProcessing:MaxPaymentAttempts` (default `2`).
-- If payment fails after retries, inventory is compensated using idempotent `SaleRestore` ledger entries.
-- Order status changes are validated by an explicit transition guard.
+- Failed payments after retries trigger idempotent inventory compensation (`SaleRestore`).
+- Order status changes are guarded by `OrderStatusTransitions`.
+- With SpiceDB enabled (Docker default), order view/cancel can require a relationship written when the order is created; see `SpiceDbAuthorizationService`.
