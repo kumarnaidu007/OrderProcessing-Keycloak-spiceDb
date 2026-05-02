@@ -1,0 +1,69 @@
+{
+  "id": "order-processing",
+  "realm": "order-processing",
+  "enabled": true,
+  "sslRequired": "none",
+  "accessTokenLifespan": 900,
+  "roles": {
+    "realm": [
+      { "name": "Admin", "description": "Admin" },
+      { "name": "Customer", "description": "Customer" }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "order-api",
+      "name": "order-api",
+      "enabled": true,
+      "publicClient": true,
+      "directAccessGrantsEnabled": true,
+      "standardFlowEnabled": true,
+      "serviceAccountsEnabled": false,
+      "protocol": "openid-connect",
+      "attributes": {},
+      "redirectUris": ["/*"],
+      "webOrigins": ["/*"],
+      "protocolMappers": [
+        {
+          "name": "aud-order-api",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "order-api",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "id": "11111111-1111-1111-1111-111111111111",
+      "username": "testuser",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "testuser@gmail.com",
+      "firstName": "Test",
+      "lastName": "User",
+      "realmRoles": ["Customer", "Admin"],
+      "credentials": [
+        { "type": "password", "value": "password", "temporary": false }
+      ]
+    },
+    {
+      "id": "22222222-2222-2222-2222-222222222222",
+      "username": "adminuser",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "admin@local.test",
+      "firstName": "Admin",
+      "lastName": "User",
+      "realmRoles": ["Admin"],
+      "credentials": [
+        { "type": "password", "value": "admin", "temporary": false }
+      ]
+    }
+  ]
+}

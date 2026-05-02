@@ -393,7 +393,12 @@ public class OrderFlowTests
             new Claim(AppClaims.Permission, PermissionCodes.OrdersReadOwn)
         };
 
-        var controller = new OrdersController(db, NullLogger<OrdersController>.Instance)
+        var controller = new OrdersController(
+            db,
+            NullLogger<OrdersController>.Instance,
+            new TestCurrentUserContext(),
+            new AllowAllSpiceDbAuthorizationService(),
+            new TestApplicationUserResolver(userId))
         {
             ControllerContext = new ControllerContext
             {
@@ -407,6 +412,34 @@ public class OrderFlowTests
             }
         };
         return controller;
+    }
+
+    private sealed class TestCurrentUserContext : ICurrentUserContext
+    {
+        public string GetSubject(ClaimsPrincipal user) =>
+            user.FindFirstValue(ClaimTypes.NameIdentifier) ?? "test-subject";
+    }
+
+    private sealed class AllowAllSpiceDbAuthorizationService : ISpiceDbAuthorizationService
+    {
+        public Task<bool> CheckOrderPermissionAsync(string subjectId, long orderId, string permission, CancellationToken ct) =>
+            Task.FromResult(true);
+
+        public Task WriteOrderOwnerAsync(string subjectId, long orderId, CancellationToken ct) =>
+            Task.CompletedTask;
+    }
+
+    private sealed class TestApplicationUserResolver : IApplicationUserResolver
+    {
+        private readonly long _userId;
+
+        public TestApplicationUserResolver(long userId)
+        {
+            _userId = userId;
+        }
+
+        public Task<long?> TryGetUserIdAsync(ClaimsPrincipal user, CancellationToken ct) =>
+            Task.FromResult<long?>(_userId);
     }
 
     private static OrderProcessingWorker BuildWorker(double paymentFailureRate, int maxPaymentAttempts = 2)

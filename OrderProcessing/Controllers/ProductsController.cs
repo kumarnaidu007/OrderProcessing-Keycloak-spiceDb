@@ -5,6 +5,7 @@ using Microsoft.EntityFrameworkCore;
 using OrderProcessing.Common;
 using OrderProcessing.Dtos.Products;
 using OrderProcessing.Models;
+using OrderProcessing.Services;
 
 namespace OrderProcessing.Controllers;
 
@@ -14,11 +15,13 @@ public class ProductsController : ControllerBase
 {
     private readonly OrderProcessingContext _db;
     private readonly ILogger<ProductsController> _logger;
+    private readonly IApplicationUserResolver _userResolver;
 
-    public ProductsController(OrderProcessingContext db, ILogger<ProductsController> logger)
+    public ProductsController(OrderProcessingContext db, ILogger<ProductsController> logger, IApplicationUserResolver userResolver)
     {
         _db = db;
         _logger = logger;
+        _userResolver = userResolver;
     }
 
     [HttpGet]
@@ -58,7 +61,9 @@ public class ProductsController : ControllerBase
                 return NotFound();
             }
 
-            if (!p.IsActive && !User.HasClaim(AppClaims.Permission, PermissionCodes.ProductsManage))
+            if (!p.IsActive &&
+                !User.HasClaim(AppClaims.Permission, PermissionCodes.ProductsManage) &&
+                !User.IsInRole(Roles.Admin))
             {
                 _logger.LogWarning("Inactive product {ProductId} access denied.", productId);
                 return NotFound();
@@ -82,7 +87,7 @@ public class ProductsController : ControllerBase
         await using var tx = await _db.Database.BeginTransactionAsync(ct);
         try
         {
-            var userId = long.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier)!);
+            var userId = await _userResolver.TryGetUserIdAsync(User, ct);
             var now = DateTime.UtcNow;
             var entity = new Product
             {
@@ -123,7 +128,7 @@ public class ProductsController : ControllerBase
         await using var tx = await _db.Database.BeginTransactionAsync(ct);
         try
         {
-            var userId = long.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier)!);
+            var userId = await _userResolver.TryGetUserIdAsync(User, ct);
             var entity = await _db.Products.FirstOrDefaultAsync(p => p.ProductId == productId, ct);
             if (entity is null)
             {

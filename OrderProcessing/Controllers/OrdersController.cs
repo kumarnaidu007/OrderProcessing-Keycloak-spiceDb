@@ -5,6 +5,7 @@ using Microsoft.EntityFrameworkCore;
 using OrderProcessing.Common;
 using OrderProcessing.Dtos.Orders;
 using OrderProcessing.Models;
+using OrderProcessing.Services;
 
 namespace OrderProcessing.Controllers;
 
@@ -15,11 +16,22 @@ public class OrdersController : ControllerBase
 {
     private readonly OrderProcessingContext _db;
     private readonly ILogger<OrdersController> _logger;
+    private readonly ICurrentUserContext _currentUser;
+    private readonly ISpiceDbAuthorizationService _spiceDbAuthorization;
+    private readonly IApplicationUserResolver _userResolver;
 
-    public OrdersController(OrderProcessingContext db, ILogger<OrdersController> logger)
+    public OrdersController(
+        OrderProcessingContext db,
+        ILogger<OrdersController> logger,
+        ICurrentUserContext currentUser,
+        ISpiceDbAuthorizationService spiceDbAuthorization,
+        IApplicationUserResolver userResolver)
     {
         _db = db;
         _logger = logger;
+        _currentUser = currentUser;
+        _spiceDbAuthorization = spiceDbAuthorization;
+        _userResolver = userResolver;
     }
 
     [HttpPost]
@@ -33,8 +45,11 @@ public class OrdersController : ControllerBase
         await using var tx = await _db.Database.BeginTransactionAsync(ct);
         try
         {
-            var userId = long.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier)!);
-            var customer = await _db.Customers.FirstOrDefaultAsync(c => c.UserId == userId, ct);
+            var userId = await _userResolver.TryGetUserIdAsync(User, ct);
+            if (userId is null)
+                return Unauthorized(new { message = "User is not mapped in application database." });
+            var subjectId = _currentUser.GetSubject(User);
+            var customer = await _db.Customers.FirstOrDefaultAsync(c => c.UserId == userId.Value, ct);
             if (customer is null)
             {
                 _logger.LogWarning("Create order failed: no customer profile for user {UserId}.", userId);
@@ -183,9 +198,10 @@ public class OrdersController : ControllerBase
                 OccurredAtUtc = now
             });
 
-            AuditLogWriter.Add(_db, nameof(Order), order.OrderId.ToString(), "order.create", userId,
+            AuditLogWriter.Add(_db, nameof(Order), order.OrderId.ToString(), "order.create", userId.Value,
                 new { customer.CustomerId, request.CustomerAddressId, total });
             await _db.SaveChangesAsync(ct);
+            await _spiceDbAuthorization.WriteOrderOwnerAsync(subjectId, order.OrderId, ct);
             await tx.CommitAsync(ct);
 
             _logger.LogInformation("Order {OrderId} created for customer {CustomerId}", order.OrderId, customer.CustomerId);
@@ -215,7 +231,7 @@ public class OrdersController : ControllerBase
                 .FirstOrDefaultAsync(o => o.OrderId == orderId, ct);
             if (order is null)
                 return NotFound();
-            if (!await CanAccessOrderAsync(order, ct))
+            if (!await CanAccessOrderAsync(order, "view", ct))
                 return Forbid();
             return Ok(MapOrder(order));
         }
@@ -235,7 +251,7 @@ public class OrdersController : ControllerBase
             var order = await _db.Orders.AsNoTracking().FirstOrDefaultAsync(o => o.OrderId == orderId, ct);
             if (order is null)
                 return NotFound();
-            if (!await CanAccessOrderAsync(order, ct))
+            if (!await CanAccessOrderAsync(order, "view", ct))
                 return Forbid();
             return Ok(new OrderStatusResponse
             {
@@ -265,7 +281,7 @@ public class OrdersController : ControllerBase
             var order = await _db.Orders.FirstOrDefaultAsync(o => o.OrderId == orderId, ct);
             if (order is null)
                 return NotFound();
-            if (!await CanAccessOrderAsync(order, ct))
+            if (!await CanAccessOrderAsync(order, "cancel", ct))
                 return Forbid();
 
             if (order.Status == OrderStatuses.Cancelled)
@@ -274,7 +290,9 @@ public class OrdersController : ControllerBase
             if (order.Status != OrderStatuses.Pending)
                 return Conflict(new { message = $"Only {OrderStatuses.Pending} orders can be cancelled. Current status: {order.Status}." });
 
-            var userId = long.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier)!);
+            var userId = await _userResolver.TryGetUserIdAsync(User, ct);
+            if (userId is null)
+                return Unauthorized(new { message = "User is not mapped in application database." });
             if (!OrderStatusTransitions.IsValid(order.Status, OrderStatuses.Cancelled))
                 return Conflict(new { message = $"Invalid transition from {order.Status} to {OrderStatuses.Cancelled}." });
 
@@ -292,7 +310,7 @@ public class OrdersController : ControllerBase
                 ToStatus = OrderStatuses.Cancelled,
                 Reason = "Order cancelled by user request",
                 ActorType = "Customer",
-                ActorUserId = userId,
+                ActorUserId = userId.Value,
                 CorrelationId = order.CorrelationId,
                 OccurredAtUtc = now
             });
@@ -304,11 +322,11 @@ public class OrdersController : ControllerBase
                 PayloadJson = "{}",
                 Severity = "Info",
                 ActorType = "Customer",
-                ActorUserId = userId,
+                ActorUserId = userId.Value,
                 CorrelationId = order.CorrelationId,
                 OccurredAtUtc = now
             });
-            AuditLogWriter.Add(_db, nameof(Order), order.OrderId.ToString(), "order.cancel", userId, null);
+            AuditLogWriter.Add(_db, nameof(Order), order.OrderId.ToString(), "order.cancel", userId.Value, null);
 
             var job = await _db.OrderProcessingJobs.FirstOrDefaultAsync(j => j.OrderId == order.OrderId, ct);
             if (job is not null && job.JobStatus is JobStatuses.Pending or JobStatuses.InProgress)
@@ -323,7 +341,7 @@ public class OrdersController : ControllerBase
 
             await _db.SaveChangesAsync(ct);
             await tx.CommitAsync(ct);
-            _logger.LogInformation("Order {OrderId} cancelled by user {UserId}.", order.OrderId, userId);
+            _logger.LogInformation("Order {OrderId} cancelled by user {UserId}.", order.OrderId, userId.Value);
             return Ok(ToStatusResponse(order));
         }
         catch (Exception ex)
@@ -353,14 +371,16 @@ public class OrdersController : ControllerBase
                 .Include(o => o.OrderShippingSnapshot)
                 .AsQueryable();
 
-            if (User.HasClaim(AppClaims.Permission, PermissionCodes.OrdersReadAll))
+            if (User.HasClaim(AppClaims.Permission, PermissionCodes.OrdersReadAll) || User.IsInRole(Roles.Admin))
             {
                 // all orders
             }
-            else if (User.HasClaim(AppClaims.Permission, PermissionCodes.OrdersReadOwn))
+            else if (User.HasClaim(AppClaims.Permission, PermissionCodes.OrdersReadOwn) || User.IsInRole(Roles.Customer))
             {
-                var userId = long.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier)!);
-                var customerId = await _db.Customers.Where(c => c.UserId == userId).Select(c => c.CustomerId).FirstOrDefaultAsync(ct);
+                var userId = await _userResolver.TryGetUserIdAsync(User, ct);
+                if (userId is null)
+                    return Ok(Array.Empty<OrderResponse>());
+                var customerId = await _db.Customers.Where(c => c.UserId == userId.Value).Select(c => c.CustomerId).FirstOrDefaultAsync(ct);
                 if (customerId == 0)
                     return Ok(Array.Empty<OrderResponse>());
                 q = q.Where(o => o.CustomerId == customerId);
@@ -386,14 +406,23 @@ public class OrdersController : ControllerBase
         }
     }
 
-    private async Task<bool> CanAccessOrderAsync(Order order, CancellationToken ct)
+    private async Task<bool> CanAccessOrderAsync(Order order, string permission, CancellationToken ct)
     {
         if (User.HasClaim(AppClaims.Permission, PermissionCodes.OrdersReadAll))
             return true;
-        if (!User.HasClaim(AppClaims.Permission, PermissionCodes.OrdersReadOwn))
+        if (User.IsInRole(Roles.Admin))
+            return true;
+
+        var subjectId = _currentUser.GetSubject(User);
+        if (await _spiceDbAuthorization.CheckOrderPermissionAsync(subjectId, order.OrderId, permission, ct))
+            return true;
+
+        if (!User.HasClaim(AppClaims.Permission, PermissionCodes.OrdersReadOwn) && !User.IsInRole(Roles.Customer))
             return false;
-        var userId = long.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier)!);
-        var customerId = await _db.Customers.Where(c => c.UserId == userId).Select(c => c.CustomerId).FirstOrDefaultAsync(ct);
+        var userId = await _userResolver.TryGetUserIdAsync(User, ct);
+        if (userId is null)
+            return false;
+        var customerId = await _db.Customers.Where(c => c.UserId == userId.Value).Select(c => c.CustomerId).FirstOrDefaultAsync(ct);
         return customerId != 0 && order.CustomerId == customerId;
     }
 

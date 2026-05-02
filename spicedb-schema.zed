@@ -1,0 +1,9 @@
+definition user {}
+
+definition order {
+  relation owner: user
+  relation admin: user
+
+  permission view = owner + admin
+  permission cancel = owner + admin
+}

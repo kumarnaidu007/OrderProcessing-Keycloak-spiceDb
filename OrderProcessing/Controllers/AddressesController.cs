@@ -5,6 +5,7 @@ using Microsoft.EntityFrameworkCore;
 using OrderProcessing.Common;
 using OrderProcessing.Dtos.Addresses;
 using OrderProcessing.Models;
+using OrderProcessing.Services;
 
 namespace OrderProcessing.Controllers;
 
@@ -16,17 +17,21 @@ public class AddressesController : ControllerBase
 {
     private readonly OrderProcessingContext _db;
     private readonly ILogger<AddressesController> _logger;
+    private readonly IApplicationUserResolver _userResolver;
 
-    public AddressesController(OrderProcessingContext db, ILogger<AddressesController> logger)
+    public AddressesController(OrderProcessingContext db, ILogger<AddressesController> logger, IApplicationUserResolver userResolver)
     {
         _db = db;
         _logger = logger;
+        _userResolver = userResolver;
     }
 
     private async Task<Customer?> GetCustomerForUserAsync(CancellationToken ct)
     {
-        var userId = long.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier)!);
-        return await _db.Customers.FirstOrDefaultAsync(c => c.UserId == userId, ct);
+        var userId = await _userResolver.TryGetUserIdAsync(User, ct);
+        if (userId is null)
+            return null;
+        return await _db.Customers.FirstOrDefaultAsync(c => c.UserId == userId.Value, ct);
     }
 
     [HttpGet]
@@ -96,7 +101,9 @@ public class AddressesController : ControllerBase
         await using var tx = await _db.Database.BeginTransactionAsync(ct);
         try
         {
-            var userId = long.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier)!);
+            var userId = await _userResolver.TryGetUserIdAsync(User, ct);
+            if (userId is null)
+                return Unauthorized(new { message = "User is not mapped in application database." });
             var customer = await GetCustomerForUserAsync(ct);
             if (customer is null)
             {
@@ -130,7 +137,7 @@ public class AddressesController : ControllerBase
             _db.CustomerAddresses.Add(entity);
             await _db.SaveChangesAsync(ct);
 
-            AuditLogWriter.Add(_db, nameof(CustomerAddress), entity.CustomerAddressId.ToString(), "address.create", userId,
+            AuditLogWriter.Add(_db, nameof(CustomerAddress), entity.CustomerAddressId.ToString(), "address.create", userId.Value,
                 new { entity.CustomerId, entity.Label });
             await _db.SaveChangesAsync(ct);
             await tx.CommitAsync(ct);
@@ -153,7 +160,9 @@ public class AddressesController : ControllerBase
         await using var tx = await _db.Database.BeginTransactionAsync(ct);
         try
         {
-            var userId = long.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier)!);
+            var userId = await _userResolver.TryGetUserIdAsync(User, ct);
+            if (userId is null)
+                return Unauthorized(new { message = "User is not mapped in application database." });
             var customer = await GetCustomerForUserAsync(ct);
             if (customer is null)
             {
@@ -188,7 +197,7 @@ public class AddressesController : ControllerBase
             if (request.IsDefault is not null) entity.IsDefault = request.IsDefault.Value;
 
             await _db.SaveChangesAsync(ct);
-            AuditLogWriter.Add(_db, nameof(CustomerAddress), entity.CustomerAddressId.ToString(), "address.update", userId, null);
+            AuditLogWriter.Add(_db, nameof(CustomerAddress), entity.CustomerAddressId.ToString(), "address.update", userId.Value, null);
             await _db.SaveChangesAsync(ct);
             await tx.CommitAsync(ct);
 
@@ -209,7 +218,9 @@ public class AddressesController : ControllerBase
         _logger.LogInformation("Deleting address {AddressId}.", addressId);
         try
         {
-            var userId = long.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier)!);
+            var userId = await _userResolver.TryGetUserIdAsync(User, ct);
+            if (userId is null)
+                return Unauthorized(new { message = "User is not mapped in application database." });
             var customer = await GetCustomerForUserAsync(ct);
             if (customer is null)
             {
@@ -233,7 +244,7 @@ public class AddressesController : ControllerBase
             }
 
             _db.CustomerAddresses.Remove(entity);
-            AuditLogWriter.Add(_db, nameof(CustomerAddress), addressId.ToString(), "address.delete", userId, null);
+            AuditLogWriter.Add(_db, nameof(CustomerAddress), addressId.ToString(), "address.delete", userId.Value, null);
             await _db.SaveChangesAsync(ct);
             _logger.LogInformation("Deleted address {AddressId}.", addressId);
             return NoContent();

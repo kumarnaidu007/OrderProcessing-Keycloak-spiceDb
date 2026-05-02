@@ -7,14 +7,124 @@ services:
       MSSQL_SA_PASSWORD: "YourStrong!Passw0rd"
     ports:
       - "14333:1433"
+    volumes:
+      - mssql-data:/var/opt/mssql
     healthcheck:
-      test: [
-        "CMD-SHELL",
-        "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P \"$${MSSQL_SA_PASSWORD}\" -Q \"SELECT 1\" || exit 1"
-      ]
+      test:
+        [
+          "CMD-SHELL",
+          '/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P "$${MSSQL_SA_PASSWORD}" -Q "SELECT 1" || exit 1'
+        ]
       interval: 10s
       timeout: 5s
       retries: 15
+
+  spicedb-db:
+    image: postgres:16-alpine
+    container_name: orderprocessing-spicedb-db
+    environment:
+      POSTGRES_USER: spicedb
+      POSTGRES_PASSWORD: spicedb
+      POSTGRES_DB: spicedb
+    volumes:
+      - spicedb-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U spicedb -d spicedb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # authzed/spicedb is distroless — no /bin/sh. Use binary argv only.
+  spicedb-migrate:
+    image: authzed/spicedb:latest
+    container_name: orderprocessing-spicedb-migrate
+    depends_on:
+      spicedb-db:
+        condition: service_healthy
+    command:
+      - datastore
+      - migrate
+      - head
+      - --datastore-engine
+      - postgres
+      - --datastore-conn-uri
+      - postgres://spicedb:spicedb@spicedb-db:5432/spicedb?sslmode=disable
+    restart: "no"
+
+  spicedb:
+    image: authzed/spicedb:latest
+    container_name: orderprocessing-spicedb
+    depends_on:
+      spicedb-migrate:
+        condition: service_completed_successfully
+    command:
+      - serve
+      - --grpc-preshared-key
+      - spicedb-dev-key
+      - --datastore-engine
+      - postgres
+      - --datastore-conn-uri
+      - postgres://spicedb:spicedb@spicedb-db:5432/spicedb?sslmode=disable
+      - --http-enabled
+      - "true"
+      - --grpc-addr
+      - 0.0.0.0:50051
+      - --http-addr
+      - 0.0.0.0:8443
+    ports:
+      - "50051:50051"
+      - "8443:8443"
+
+  spicedb-wait:
+    image: busybox:1.36
+    container_name: orderprocessing-spicedb-wait
+    depends_on:
+      - spicedb
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        i=0
+        until nc -z spicedb 50051; do
+          i=$$((i+1))
+          if [ "$$i" -ge 60 ]; then echo SpiceDB not reachable >&2; exit 1; fi
+          sleep 2
+        done
+        echo ok
+    restart: "no"
+
+  spicedb-init:
+    image: authzed/zed:latest
+    container_name: orderprocessing-spicedb-init
+    depends_on:
+      spicedb-wait:
+        condition: service_completed_successfully
+    volumes:
+      - ./spicedb-schema.zed:/schema.zed:ro
+    command:
+      - --endpoint
+      - spicedb:50051
+      - --token
+      - spicedb-dev-key
+      - --insecure
+      - schema
+      - write
+      - /schema.zed
+    restart: "no"
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:25.0
+    container_name: orderprocessing-keycloak
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_HOSTNAME_STRICT: "false"
+      KC_HOSTNAME_STRICT_HTTPS: "false"
+    volumes:
+      - keycloak-data:/opt/keycloak/data
+      - ./keycloak/import:/opt/keycloak/data/import:ro
+    ports:
+      - "8081:8080"
 
   api:
     build:
@@ -24,8 +134,25 @@ services:
     environment:
       ASPNETCORE_ENVIRONMENT: "Development"
       ConnectionStrings__DefaultConnection: "Server=db,1433;Database=OrderProcessing;User Id=sa;Password=YourStrong!Passw0rd;Encrypt=False;TrustServerCertificate=True"
+      Keycloak__MetadataAuthority: "http://keycloak:8080/realms/order-processing"
+      Keycloak__ValidIssuers__0: "http://localhost:8081/realms/order-processing"
+      Keycloak__ValidIssuers__1: "http://keycloak:8080/realms/order-processing"
+      Keycloak__Audience: "order-api"
+      Keycloak__RequireHttpsMetadata: "false"
+      SpiceDb__Enabled: "true"
+      SpiceDb__HttpEndpoint: "http://spicedb:8443"
+      SpiceDb__PreSharedKey: "spicedb-dev-key"
     ports:
       - "8080:8080"
     depends_on:
       db:
         condition: service_healthy
+      keycloak:
+        condition: service_started
+      spicedb-init:
+        condition: service_completed_successfully
+
+volumes:
+  mssql-data:
+  keycloak-data:
+  spicedb-pg-data:
