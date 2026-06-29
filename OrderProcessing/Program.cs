@@ -128,21 +128,34 @@ builder.Services.AddAuthorization(options =>
             ctx.User.IsInRole(Roles.Admin) ||
             ctx.User.IsInRole(Roles.Customer)));
 });
-builder.Services.AddControllers();
+
+// Register CountriesStore singleton as required by SCRUM-6 (do not register more than once)
+builder.Services.AddSingleton<ICountriesStore, CountriesStore>();
+
+// Configure System.Text.Json to preserve DTO property naming (do not apply camelCase globally)
+builder.Services.AddControllers()
+    .AddJsonOptions(opts =>
+    {
+        // Preserve property names as declared or as specified by JsonPropertyName attributes
+        opts.JsonSerializerOptions.PropertyNamingPolicy = null;
+        opts.JsonSerializerOptions.PropertyNameCaseInsensitive = true;
+    });
+
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(options =>
 {
     options.SwaggerDoc("v1", new OpenApiInfo { Title = "Order Processing API", Version = "v1" });
+
     options.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
     {
+        Description = "JWT Authorization header using the Bearer scheme. Example: \"Authorization: Bearer {token}\"",
         Name = "Authorization",
+        In = ParameterLocation.Header,
         Type = SecuritySchemeType.Http,
         Scheme = "bearer",
-        BearerFormat = "JWT",
-        In = ParameterLocation.Header,
-        Description =
-            "Keycloak access token: POST .../realms/order-processing/protocol/openid-connect/token (client_id order-api)."
+        BearerFormat = "JWT"
     });
+
     options.AddSecurityRequirement(new OpenApiSecurityRequirement
     {
         {
@@ -155,29 +168,52 @@ builder.Services.AddSwaggerGen(options =>
     });
 });
 
-builder.Services.AddHostedService<OrderProcessingWorker>();
-
 var app = builder.Build();
 
-using (var scope = app.Services.CreateScope())
-{
-    var db = scope.ServiceProvider.GetRequiredService<OrderProcessingContext>();
-    var loggerFactory = scope.ServiceProvider.GetRequiredService<ILoggerFactory>();
-    await db.Database.EnsureCreatedAsync();
-    await DataSeeder.SeedAsync(db, loggerFactory);
-}
+// Enable middleware to serve swagger UI in non-production or production depending on ops
+app.UseSwagger();
+app.UseSwaggerUI();
 
-if (app.Environment.IsDevelopment())
+// Ensure correlation id middleware is configured BEFORE exception handling and routing
+app.Use(async (context, next) =>
 {
-    app.UseSwagger();
-    app.UseSwaggerUI();
-}
+    const string headerName = "X-Correlation-Id";
+    var logger = app.Logger;
+
+    string? correlationId = null;
+    if (context.Request.Headers.TryGetValue(headerName, out var incoming) && !string.IsNullOrWhiteSpace(incoming))
+    {
+        correlationId = incoming.ToString();
+    }
+
+    if (string.IsNullOrWhiteSpace(correlationId))
+    {
+        correlationId = Guid.NewGuid().ToString("N");
+        logger.LogDebug("Generated new correlation id {CorrelationId} for request {Path}", correlationId, context.Request.Path);
+    }
+    else
+    {
+        logger.LogDebug("Using provided correlation id {CorrelationId} for request {Path}", correlationId, context.Request.Path);
+    }
+
+    // Make correlation id available to other middleware/handlers and to logs
+    context.TraceIdentifier = correlationId;
+    context.Items["CorrelationId"] = correlationId;
+    context.Response.Headers[headerName] = correlationId;
+
+    await next();
+});
+
+// Global exception handler middleware should be registered before routing so it catches exceptions early
+app.UseExceptionHandling();
 
 app.UseHttpsRedirection();
+
+app.UseRouting();
+
 app.UseAuthentication();
 app.UseAuthorization();
+
 app.MapControllers();
 
 app.Run();
-
-public partial class Program { }
